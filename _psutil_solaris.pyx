@@ -28,6 +28,8 @@ ctypedef int int32_t
 ctypedef int gid_t
 ctypedef int uid_t
 ctypedef int pid_t
+ctypedef int ino_t
+ctypedef int dev_t
 ctypedef long time_t
 ctypedef long suseconds_t
 ctypedef unsigned char uchar_t
@@ -35,6 +37,9 @@ ctypedef unsigned int uint32_t
 ctypedef signed long long int int64_t
 ctypedef unsigned long long int uint64_t
 ctypedef unsigned long long u_longlong_t
+ctypedef unsigned long ulong_t
+ctypedef ulong_t major_t
+ctypedef ulong_t minor_t
 ctypedef long long longlong_t
 ctypedef unsigned int uint_t
 ctypedef int intptr_t
@@ -180,6 +185,10 @@ cdef extern from "sys/sysinfo.h":
         cpu_sysinfo_t   cpu_sysinfo 
         cpu_syswait_t   cpu_syswait 
         cpu_vminfo_t    cpu_vminfo 
+
+cdef extern from "sys/mkdev.h":
+    cdef major_t major(dev_t)
+    cdef minor_t minor(dev_t)
 
 cdef extern from "kstat.h":
     enum: KSTAT_STRLEN
@@ -781,6 +790,7 @@ cdef class Process:
     def _update_info(self):
         """updates psinfo_t pointer"""
         cdef int error = 0
+        cdef size_t size
         cdef PyThreadState *_save
         cdef psinfo_t pstmp
         self.is_running()
@@ -789,11 +799,11 @@ cdef class Process:
         if self.process is not NULL and (x - self._tstamp) <= 1.0:
             return # let the structure be cached for a second
 
+        size = os.stat('/proc/%d/psinfo' % (self._pid,)).st_size 
         _save = PyEval_SaveThread()
         # NOTE snapshot is gil free
         error = snapshot(
-            make_resource(self._pid, 'psinfo'), &pstmp, sizeof(psinfo_t)
-        )
+            make_resource(self._pid, 'psinfo'), &pstmp, size)
         PyEval_RestoreThread(_save)
 
         if error:
@@ -805,12 +815,9 @@ cdef class Process:
 
         if self.process is not NULL:
             self.process = <psinfo_t *>realloc(
-                <void *>self.process, sizeof(psinfo_t)
-            )
+                <void *>self.process, size)
         else:
-            self.process = <psinfo_t *>malloc(
-                sizeof(psinfo_t)
-            )
+            self.process = <psinfo_t *>malloc(size)
 
         if self.process is NULL:
             raise MemoryError()
@@ -819,12 +826,12 @@ cdef class Process:
 
         # not sure if the stuctures overlap, so be safe
         self.process = <psinfo_t *>memmove(
-            <void *>self.process, &pstmp, sizeof(psinfo_t)
-        )
+            <void *>self.process, &pstmp, size)
 
     def _update_status(self):
         """updates pstatus_t pointer"""
         cdef int error = 0
+        cdef size_t size
         cdef PyThreadState *_save
         cdef pstatus_t pstmp
         self.is_running()
@@ -833,11 +840,11 @@ cdef class Process:
         if self.status is not NULL and (x - self._tstamp) <= 1.0:
             return # let the structure be cached for a second
 
+        size = os.stat('/proc/%d/status' % (self._pid,)).st_size 
         _save = PyEval_SaveThread()
         # NOTE snapshot is gil free
         error = snapshot(
-            make_resource(self._pid, 'status'), &pstmp, sizeof(pstatus_t)
-        )
+            make_resource(self._pid, 'status'), &pstmp, size)
         PyEval_RestoreThread(_save)
 
         if error:
@@ -849,12 +856,9 @@ cdef class Process:
 
         if self.status is not NULL:
             self.status = <pstatus_t *>realloc(
-                <void *>self.status, sizeof(pstatus_t)
-            )
+                <void *>self.status, size)
         else:
-            self.status = <pstatus_t *>malloc(
-                sizeof(pstatus_t)
-            )
+            self.status = <pstatus_t *>malloc(size)
 
         if self.status is NULL:
             raise MemoryError()
@@ -863,8 +867,7 @@ cdef class Process:
 
         # not sure if the stuctures overlap, so be safe
         self.status = <pstatus_t *>memmove(
-            <void *>self.status, &pstmp, sizeof(pstatus_t)
-        )
+            <void *>self.status, &pstmp, size)
 
     @_wrap_error
     def get_process_ppid(self):
@@ -1133,10 +1136,9 @@ cdef class Process:
 
 ################################################################################
 # Start Memory Mapping Code
-# 
-# This code is complex and error prone.  Its only saving grace is that it does
-# handle all memory map files that /proc currently provides.
 #
+# Needs verification that it is working correctly.
+# 
 # NOTE: The following is for reference only.
 # http://src.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/cmd/ptools/pmap
 ################################################################################
@@ -1145,22 +1147,123 @@ cdef class Process:
     nt_mmap_grouped = namedtuple('mmap', ' '.join(_mmap_base_fields))
     nt_mmap_ext = namedtuple('mmap', 'addr perms ' + ' '.join(_mmap_base_fields))
 
+    cdef object _get_mem_name(self, prxmap_t *p):
+        """name the memory map"""
+        cdef int _p = self._pid
+        cdef dev_t dev
+        cdef ino_t ino
+        vaddr_sz = p.pr_vaddr + p.pr_size
+        brk_base_sz = self.status.pr_brkbase + self.status.pr_brksize
+        # attempt to get the name of the resource
+        if not (p.pr_mflags & MA_ANON) or vaddr_sz <= self.status.pr_brkbase \
+                or p.pr_vaddr >= brk_base_sz:
+            try: return os.readlink('/proc/%d/path/%s' % (_p, p.pr_mapname))
+            except: pass
+            # fallback to the object information
+            try:
+                x = os.stat('/proc/%d/object/%s' % (_p, p.pr_mapname))
+                dev = x.st_dev
+                ino = x.st_ino
+                return "dev:%d,%d ino:%d" % (major(dev), minor(dev), ino)
+            except: pass
+        # attempt to get the shared memory names
+        if p.pr_mflags & MA_ISM or p.pr_mflags & MA_SHM:
+            ismdism = p.pr_mflags & MA_NORESERVE and 'ism' or 'dism'
+            if p.pr_shmid == -1:
+                return '[%s shmid=null]' % (ismdism,)
+            return '[%s shmid=0x%x]' % (ismdism, p.pr_shmid)
+        # add the stack base and size
+        stk_base_sz = self.status.pr_stkbase + self.status.pr_stksize
+        if vaddr_sz > self.status.pr_stkbase and p.pr_vaddr < stk_base_sz:
+            return '[stack]'
+        elif p.pr_mflags & MA_ANON and vaddr_sz > self.status.pr_brkbase \
+                and p.pr_vaddr < brk_base_sz:
+            return '[heap]'
+#TODO '[%s tid=%d]' #requires examining stackspace
+        return '[anon]'
+
+    cdef object _get_perms(self, prxmap_t *p):
+        """create the permission string 'rwxsR'"""
+        result = ""
+        result += p.pr_mflags & MA_READ and 'r' or '-'
+        result += p.pr_mflags & MA_WRITE and 'w' or '-'
+        result += p.pr_mflags & MA_EXEC and 'x' or '-'
+        result += p.pr_mflags & MA_SHARED and 's' or '-'
+        result += p.pr_mflags & MA_NORESERVE and 'R' or '-'
+        result += p.pr_mflags & MA_RESERVED1 and '*' or '-'
+        return result
+
+    cdef ulong_t _get_swap(self, prxmap_t *p):
+        """used to calculate where swap is being used"""
+        if p.pr_mflags & MA_SHARED|MA_NORESERVE and p.pr_pagesize:
+            # swap reserved for entire non-ism SHM
+            return p.pr_size / p.pr_pagesize
+        elif p.pr_mflags & MA_NORESERVE:
+            # swap reserved on fault for each anon page
+            return p.pr_anon
+        elif p.pr_mflags & MA_WRITE and p.pr_pagesize:
+            # swap reserved for entire writable segment
+            return p.pr_size / p.pr_pagesize
+        return 0
+
     @_wrap_error
     def get_memory_maps(self):
         """returns the memory maps as a namedtuple"""
         # may raise an access error
-#FIXME original implementation caused segfaults after initial access
-#so that code has been committed. I should have the implementation vetted out
-#in a day or so.
+        cdef prxmap_t *xmap, *p
+        cdef size_t size, nread
+        cdef int nmap, fd
         self._update_status()
 
-        x = open('/proc/%d/xmap' % (self._pid,),'rb')
-        try:
-            #this method has been removed due to bad behaviour
-            #return self._decode_map(x.fileno(), 'xmap')
-            raise AccessDenied(self.pid, self._process_name)
-        finally:
+        m = '/proc/%d/xmap' % (self._pid,)
+        size = os.stat(m).st_size
+        x = open(m, 'rb')
+        fd = x.fileno()
+        xmap = <prxmap_t *>malloc(size)
+
+        if xmap is NULL:
             x.close()
+            raise MemoryError()
+
+        nread = pread(fd, xmap, size, 0)
+        # close file
+        x.close()
+        if nread < 0:
+            free(xmap)
+            raise IOError(errno, strerror(errno))
+
+        nmap = nread / sizeof(prxmap_t)
+
+        p = xmap
+        returnlist = []
+        # interate through the map
+        while nmap:
+            nmap -= 1
+            if p is NULL:
+                p += 1
+                continue
+            # make sure the address is within range
+            pr_addr_sz = p.pr_vaddr + p.pr_size
+            if not addr_in_range(p.pr_vaddr, pr_addr_sz, p.pr_pagesize):
+                p += 1
+                continue
+            
+            returnlist.append(tuple([
+                toaddr(p.pr_vaddr, pr_addr_sz),
+                self._get_perms(p),
+                self._get_mem_name(p),
+                p.pr_rss * p.pr_pagesize,
+                p.pr_size,
+                p.pr_offset,
+                p.pr_anon * p.pr_pagesize,
+                p.pr_locked * p.pr_pagesize,
+                self._get_swap(p),
+            ]))
+            # increment pointer
+            p += 1
+
+        free(xmap)
+        return returnlist
 ################################################################################
 # End Memory Mapping Code
 ################################################################################
