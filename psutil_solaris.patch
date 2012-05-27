@@ -1,0 +1,34 @@
+Index: psutil/__init__.py
+===================================================================
+--- psutil/__init__.py  (revision 1312)
++++ psutil/__init__.py  (working copy)
+@@ -82,6 +82,9 @@
+ elif sys.platform.lower().startswith("freebsd"):
+     import psutil._psbsd as _psplatform
+ 
++elif sys.platform.lower().startswith("sunos"):
++    import psutil._psutil_solaris as _psplatform
++
+ else:
+     raise NotImplementedError('platform %s is not supported' % sys.platform)
+ 
+Index: setup.py
+===================================================================
+--- setup.py    (revision 1312)
++++ setup.py    (working copy)
+@@ -76,6 +76,14 @@
+                             sources=['psutil/_psutil_linux.c'],
+                             ),
+                   posix_extension]
++# Solaris
++elif sys.platform.lower().startswith('sunos'):
++    # on solaris disutils behaves dumb
++    extensions = [Extension('_psutil_solaris',
++                           sources=['psutil/_psutil_solaris.c'],
++                           libraries=['kstat'],
++                          ),
++                  ]
+ else:
+     raise NotImplementedError('platform %s is not supported' % sys.platform)
+ 
+
