@@ -849,7 +849,7 @@ cdef class Process:
 
         if self.status is not NULL:
             self.status = <pstatus_t *>realloc(
-                <void *>self.process, sizeof(pstatus_t)
+                <void *>self.status, sizeof(pstatus_t)
             )
         else:
             self.status = <pstatus_t *>malloc(
